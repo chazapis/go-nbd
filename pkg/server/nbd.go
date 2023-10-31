@@ -3,9 +3,13 @@ package server
 import (
 	"bytes"
 	"encoding/binary"
+	"context"
 	"errors"
 	"io"
 	"net"
+	"time"
+
+    "golang.org/x/sync/errgroup"
 
 	"github.com/pojntfx/go-nbd/pkg/backend"
 	"github.com/pojntfx/go-nbd/pkg/protocol"
@@ -316,39 +320,67 @@ n:
 	}
 
 	// Transmission
-	b := make([]byte, maximumPacketSize)
+	ctx, _ := context.WithCancel(context.Background())
+	group, _ := errgroup.WithContext(ctx)
+	responseCh := make(chan *Response, 1024)
+	group.Go(func() error {
+		return Writer(ctx, conn, responseCh)
+	})
+	group.Go(func() error {
+		return Reader(ctx, conn, export, options, responseCh)
+	})
+
+	if err := group.Wait(); err != nil {
+		return err
+	}
+	return nil
+}
+
+type Response struct {
+	Handle  uint64
+	Data    []byte
+	Offset  uint64
+	Error   uint32
+}
+
+func Reader(ctx context.Context, conn net.Conn, export *Export, options *Options, responseCh chan<- *Response) error {
+	defer conn.Close()
+
+	var requestHeader protocol.TransmissionRequestHeader
+
 	for {
-		var requestHeader protocol.TransmissionRequestHeader
-		if err := binary.Read(conn, binary.BigEndian, &requestHeader); err != nil {
+		if err := conn.SetReadDeadline(time.Now().Add(1 * time.Second)); err != nil {
 			return err
+		}
+		if err := binary.Read(conn, binary.BigEndian, &requestHeader); err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				return err
+			}
+
 		}
 
 		if requestHeader.RequestMagic != protocol.TRANSMISSION_MAGIC_REQUEST {
 			return ErrInvalidMagic
 		}
 
+		if requestHeader.Length > maximumPacketSize {
+			return ErrInvalidBlocksize
+		}
+
 		switch requestHeader.Type {
 		case protocol.TRANSMISSION_TYPE_REQUEST_READ:
-			if err := binary.Write(conn, binary.BigEndian, protocol.TransmissionReplyHeader{
-				ReplyMagic: protocol.TRANSMISSION_MAGIC_REPLY,
-				Error:      0,
-				Handle:     requestHeader.Handle,
-			}); err != nil {
-				return err
+			resp := &Response{
+				Handle: requestHeader.Handle,
+				Data:   make([]byte, requestHeader.Length),
+				Offset: requestHeader.Offset,
 			}
-
-			if len(b) <= int(requestHeader.Length) {
-				return ErrInvalidBlocksize
-			}
-
-			n, err := export.Backend.ReadAt(b[:requestHeader.Length], int64(requestHeader.Offset))
-			if err != nil {
-				return err
-			}
-
-			if _, err := conn.Write(b[:n]); err != nil {
-				return err
-			}
+			go HandleRead(export, responseCh, resp)
 		case protocol.TRANSMISSION_TYPE_REQUEST_WRITE:
 			if options.ReadOnly {
 				_, err := io.CopyN(io.Discard, conn, int64(requestHeader.Length)) // Discard the write command's data
@@ -356,37 +388,26 @@ n:
 					return err
 				}
 
-				if err := binary.Write(conn, binary.BigEndian, protocol.TransmissionReplyHeader{
-					ReplyMagic: protocol.TRANSMISSION_MAGIC_REPLY,
-					Error:      protocol.TRANSMISSION_ERROR_EPERM,
-					Handle:     requestHeader.Handle,
-				}); err != nil {
-					return err
+				responseCh <- &Response{
+					Handle: requestHeader.Handle,
+					Error: 	protocol.TRANSMISSION_ERROR_EPERM,
 				}
-
 				break
 			}
 
-			if len(b) <= int(requestHeader.Length) {
-				return ErrInvalidBlocksize
+			resp := &Response{
+				Handle: requestHeader.Handle,
+				Data:   make([]byte, requestHeader.Length),
+				Offset: requestHeader.Offset,
 			}
-
-			n, err := io.ReadAtLeast(conn, b[:requestHeader.Length], int(requestHeader.Length))
+			n, err := io.ReadAtLeast(conn, resp.Data, int(requestHeader.Length))
 			if err != nil {
 				return err
 			}
-
-			if _, err := export.Backend.WriteAt(b[:n], int64(requestHeader.Offset)); err != nil {
-				return err
+			if n != int(requestHeader.Length) {
+				resp.Data = resp.Data[:n]
 			}
-
-			if err := binary.Write(conn, binary.BigEndian, protocol.TransmissionReplyHeader{
-				ReplyMagic: protocol.TRANSMISSION_MAGIC_REPLY,
-				Error:      0,
-				Handle:     requestHeader.Handle,
-			}); err != nil {
-				return err
-			}
+			go HandleWrite(export, responseCh, resp)
 		case protocol.TRANSMISSION_TYPE_REQUEST_DISC:
 			if !options.ReadOnly {
 				if err := export.Backend.Sync(); err != nil {
@@ -401,13 +422,63 @@ n:
 				return err
 			}
 
-			if err := binary.Write(conn, binary.BigEndian, protocol.TransmissionReplyHeader{
-				ReplyMagic: protocol.TRANSMISSION_MAGIC_REPLY,
-				Error:      protocol.TRANSMISSION_ERROR_EINVAL,
-				Handle:     requestHeader.Handle,
-			}); err != nil {
-				return err
+			responseCh <- &Response{
+				Handle: requestHeader.Handle,
+				Error: 	protocol.TRANSMISSION_ERROR_EINVAL,
 			}
 		}
 	}
+	return nil
 }
+
+func Writer(ctx context.Context, conn net.Conn, responseCh <-chan *Response) error {
+	defer conn.Close()
+
+	header := protocol.TransmissionReplyHeader{
+		ReplyMagic: protocol.TRANSMISSION_MAGIC_REPLY,
+		Error:      0,
+		Handle:     0,
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case resp := <-responseCh:
+			header.Handle = resp.Handle
+			header.Error = resp.Error
+			if err := binary.Write(conn, binary.BigEndian, header); err != nil {
+				return err
+			}
+			if resp.Error == 0 && resp.Data != nil {
+				if _, err := conn.Write(resp.Data); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func HandleRead(export *Export, responses chan<- *Response, resp *Response) {
+	n, err := export.Backend.ReadAt(resp.Data, int64(resp.Offset))
+	if err != nil {
+		resp.Error = protocol.TRANSMISSION_ERROR_EIO
+		responses <- resp
+		return
+	}
+	if n != len(resp.Data) {
+		resp.Data = resp.Data[:n]
+	}
+	responses <- resp
+}
+
+func HandleWrite(export *Export, responses chan<- *Response, resp *Response) {
+	if _, err := export.Backend.WriteAt(resp.Data, int64(resp.Offset)); err != nil {
+		resp.Error = protocol.TRANSMISSION_ERROR_EIO
+		responses <- resp
+		return
+	}
+	resp.Data = nil
+	responses <- resp
+}
+
