@@ -141,7 +141,7 @@ n:
 				if err := binary.Write(info, binary.BigEndian, protocol.NegotiationReplyInfo{
 					Type:              protocol.NEGOTIATION_TYPE_INFO_EXPORT,
 					Size:              uint64(size),
-					TransmissionFlags: 0,
+					TransmissionFlags: 0b1000_0001_0000_0000,
 				}); err != nil {
 					return err
 				}
